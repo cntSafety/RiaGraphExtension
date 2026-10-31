@@ -1,0 +1,476 @@
+#include "function/gql_function.h"
+
+#include "GQLLexer.h"
+#include "GQLParser.h"
+#include "antlr4-runtime.h"
+#include "gql_transformer.hpp"
+
+#include "catalog/catalog.h"
+#include "catalog/catalog_entry/graph_catalog_entry.h"
+#include "extension/extension_manager.h"
+#include "common/exception/runtime.h"
+#include "common/string_utils.h"
+#include "common/vector/value_vector.h"
+#include "function/scalar_function.h"
+#include "function/table/bind_data.h"
+#include "function/table/bind_input.h"
+#include "function/table/table_function.h"
+#include "main/client_context.h"
+#include "main/database.h"
+#include "main/database_manager.h"
+#include "transaction/transaction.h"
+
+#include <algorithm>
+#include <cctype>
+#include <format>
+#include <string>
+#include <vector>
+
+namespace lbug {
+namespace gql_extension {
+
+using namespace lbug::common;
+using namespace lbug::function;
+using namespace lbug::main;
+
+// Captures ANTLR syntax errors so the first message can be surfaced in the
+// "Failed to parse GQL query" exception instead of being lost to /dev/null.
+class GqlErrorCollector final : public antlr4::BaseErrorListener {
+public:
+    std::vector<std::string> messages;
+
+    void syntaxError(antlr4::Recognizer * /*recognizer*/, antlr4::Token * /*offendingSymbol*/,
+                     size_t line, size_t charPositionInLine, const std::string &msg,
+                     std::exception_ptr /*e*/) override {
+        messages.push_back("line " + std::to_string(line) + ":" +
+                           std::to_string(charPositionInLine) + " " + msg);
+    }
+};
+
+// =============================================================================
+// Bind data: holds the Cypher query produced by GQL→Cypher translation
+// =============================================================================
+
+struct GqlBindData final : TableFuncBindData {
+    std::string cypherQuery;
+    // True when the statement is "CREATE [PROPERTY] GRAPH IF NOT EXISTS <name>".
+    // LadybugDB Cypher has no IF NOT EXISTS for CREATE GRAPH, so the existence
+    // semantics are enforced at rewrite time.
+    bool ifNotExistsCreateGraph;
+    std::string graphName;
+
+    GqlBindData(std::string cypherQuery, bool ifNotExistsCreateGraph = false,
+                std::string graphName = {})
+        : TableFuncBindData{binder::expression_vector{}, 0 /* maxOffset */},
+          cypherQuery{std::move(cypherQuery)},
+          ifNotExistsCreateGraph{ifNotExistsCreateGraph},
+          graphName{std::move(graphName)} {}
+
+    std::unique_ptr<TableFuncBindData> copy() const override {
+        return std::make_unique<GqlBindData>(*this);
+    }
+};
+
+// =============================================================================
+// Rewrite function: returns the Cypher string to be executed in place of CALL
+// =============================================================================
+
+static std::string rewriteFunc(ClientContext &context,
+                                const TableFuncBindData &bindData) {
+    auto *gqlData = bindData.constPtrCast<GqlBindData>();
+
+    // Emulate GQL "CREATE GRAPH IF NOT EXISTS" semantics: if a graph with the
+    // target name already exists, rewrite the statement to a no-op.
+    if (gqlData->ifNotExistsCreateGraph && !gqlData->graphName.empty()) {
+        auto *transaction = transaction::Transaction::Get(context);
+        auto *catalog = context.getDatabase()->getCatalog();
+        auto graphEntries = catalog->getGraphEntries(transaction);
+        for (auto *entry : graphEntries) {
+            if (entry->getName() == gqlData->graphName) {
+                return GqlToCypherTransformer::EMPTY_RESULT_CYPHER; // graph already exists
+            }
+        }
+    }
+
+    return gqlData->cypherQuery;
+}
+
+// LadybugDB-specific DDL that the GQL grammar doesn't cover. These are passed
+// through verbatim so statements such as CALL GQL("CREATE NODE TABLE ...")
+// work unchanged. Everything else that fails GQL parsing is a genuine GQL
+// syntax error and must not be forwarded to the Cypher parser.
+static bool isDdlPassThrough(const std::string &query) {
+    static const std::vector<std::string> prefixes = {
+        "CREATE NODE TABLE", "CREATE REL TABLE", "CREATE EDGE TABLE",
+        "DROP NODE TABLE",   "DROP REL TABLE",   "DROP EDGE TABLE",
+        "ALTER NODE TABLE",  "ALTER REL TABLE",  "ALTER EDGE TABLE",
+        "COPY ",             "LOAD FROM",
+    };
+    std::string upper(query.size(), '\0');
+    std::transform(query.begin(), query.end(), upper.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    for (const auto &prefix : prefixes) {
+        if (upper.compare(0, prefix.size(), prefix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ISO GQL's SELECT body takes a bare <graph expression> after FROM
+// ("FROM myGraph MATCH ...", "FROM CURRENT_GRAPH MATCH ...") — there is no
+// GRAPH keyword there. The "FROM GRAPH x" spelling is commonly generated by
+// tools, so accept it as a lenient pre-parse normalization. String literals
+// and quoted identifiers are left untouched.
+static std::string normalizeFromGraphClause(const std::string &text) {
+    std::string out;
+    out.reserve(text.size());
+    auto isIdentChar = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    };
+    auto iequalWord = [](const std::string &a, const char *b) {
+        size_t n = std::char_traits<char>::length(b);
+        if (a.size() != n) return false;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::toupper(static_cast<unsigned char>(a[i])) !=
+                std::toupper(static_cast<unsigned char>(b[i]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    size_t i = 0;
+    while (i < text.size()) {
+        char c = text[i];
+        if (c == '\'' || c == '"' || c == '`') {
+            char quote = c;
+            out += c;
+            ++i;
+            while (i < text.size()) {
+                out += text[i];
+                if (text[i] == quote) {
+                    if (i + 1 < text.size() && text[i + 1] == quote) {
+                        out += text[i + 1];
+                        i += 2;
+                        continue;
+                    }
+                    ++i;
+                    break;
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+            size_t start = i;
+            while (i < text.size() && isIdentChar(text[i])) ++i;
+            std::string word = text.substr(start, i - start);
+            bool afterDot = start > 0 && text[start - 1] == '.';
+            if (!afterDot && iequalWord(word, "FROM")) {
+                size_t j = i;
+                while (j < text.size() && std::isspace(static_cast<unsigned char>(text[j]))) ++j;
+                size_t gStart = j;
+                while (j < text.size() && isIdentChar(text[j])) ++j;
+                if (iequalWord(text.substr(gStart, j - gStart), "GRAPH")) {
+                    out += word;                     // FROM (original casing)
+                    out += text.substr(i, gStart - i); // keep the whitespace
+                    i = j;                           // drop the GRAPH keyword
+                    continue;
+                }
+            }
+            out += word;
+            continue;
+        }
+        out += c;
+        ++i;
+    }
+    return out;
+}
+
+// ISO GQL references a graph type by bare name after the graph name
+// ("CREATE GRAPH g mytype"). The "TYPE" spelling ("CREATE GRAPH g TYPE mytype")
+// is commonly generated by tools but does not parse (unquoted TYPE there would
+// start a CREATE GRAPH TYPE statement), so drop that one keyword — literal
+// aware, like the FROM GRAPH normalization above. "CREATE GRAPH TYPE ..."
+// statements and quoted graph names are left untouched.
+static std::string normalizeCreateGraphTypeRef(const std::string &text) {
+    struct Tok {
+        size_t start = 0;
+        size_t stop = 0; // inclusive
+        std::string word; // identifier text; empty for quoted spans
+    };
+    std::vector<Tok> toks;
+    size_t i = 0;
+    while (i < text.size()) {
+        char c = text[i];
+        if (c == '\'' || c == '"' || c == '`') {
+            char quote = c;
+            size_t start = i++;
+            while (i < text.size()) {
+                if (text[i] == quote) {
+                    if (i + 1 < text.size() && text[i + 1] == quote) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                ++i;
+            }
+            if (i < text.size()) ++i;
+            toks.push_back({start, i - 1, ""});
+            continue;
+        }
+        auto isIdentChar = [](char ch) {
+            return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+        };
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+            size_t start = i;
+            while (i < text.size() && isIdentChar(text[i])) ++i;
+            toks.push_back({start, i - 1, text.substr(start, i - start)});
+            continue;
+        }
+        ++i;
+    }
+    auto isWord = [&](size_t j, const char *w) {
+        if (j >= toks.size() || toks[j].word.empty()) return false;
+        size_t n = std::char_traits<char>::length(w);
+        const std::string &a = toks[j].word;
+        if (a.size() != n) return false;
+        for (size_t k = 0; k < n; ++k) {
+            if (std::toupper(static_cast<unsigned char>(a[k])) !=
+                std::toupper(static_cast<unsigned char>(w[k]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!isWord(0, "CREATE")) return text;
+    size_t j = 1;
+    if (isWord(j, "OR")) {
+        ++j;
+        if (isWord(j, "REPLACE")) ++j;
+    }
+    if (isWord(j, "PROPERTY")) ++j;
+    if (!isWord(j, "GRAPH")) return text;
+    ++j;
+    if (isWord(j, "TYPE")) return text; // CREATE GRAPH TYPE <name> ...
+    if (isWord(j, "IF")) {
+        ++j;
+        if (isWord(j, "NOT")) ++j;
+        if (isWord(j, "EXISTS")) ++j;
+    }
+    if (j >= toks.size()) return text;
+    ++j; // the graph name (identifier or quoted span)
+    if (isWord(j, "TYPE")) {
+        return text.substr(0, toks[j].start) + text.substr(toks[j].stop + 1);
+    }
+    return text;
+}
+
+// =============================================================================
+// Bind function: parses GQL and produces Cypher
+// =============================================================================
+
+// Whether a named graph ("" = the session's current graph) is an open ANY
+// graph (labels in a STRING[] column) vs a typed/tabled graph (one label =
+// table name). GQL label expressions translate differently per kind — see the
+// label-expression section in gql_transformer.cpp.
+static std::optional<bool> resolveAnyGraph(ClientContext &context, const std::string &name) {
+    auto *transaction = transaction::Transaction::Get(context);
+    if (name.empty()) {
+        // Session's current graph: ANY vs typed is decided by the core, which holds
+        // the graph-registry lock across the check (see DatabaseManager::
+        // isDefaultGraphAny). False when no graph is selected (main catalog).
+        return DatabaseManager::Get(context)->isDefaultGraphAny(context);
+    }
+    auto upper = common::StringUtils::getUpper(name);
+    if (upper == "MAIN") {
+        return false;
+    }
+    auto *catalog = context.getDatabase()->getCatalog();
+    for (auto *entry : catalog->getGraphEntries(transaction)) {
+        if (common::StringUtils::getUpper(entry->getName()) == upper) {
+            return entry->isAnyGraphType();
+        }
+    }
+    return std::nullopt;
+}
+
+static std::unique_ptr<TableFuncBindData> bindFunc(ClientContext *context,
+                                                    const TableFuncBindInput *input) {
+
+    // Get the GQL query string from the first parameter
+    auto gqlQuery = input->getLiteralVal<std::string>(0);
+
+    // Strip trailing semicolon and whitespace
+    std::string trimmed = gqlQuery;
+    while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.back()))) {
+        trimmed.pop_back();
+    }
+    if (!trimmed.empty() && trimmed.back() == ';') {
+        trimmed.pop_back();
+    }
+
+    if (trimmed.empty()) {
+        throw common::RuntimeException{"GQL query string must not be empty"};
+    }
+
+    // Lenient surface normalization before parsing (see helpers above).
+    trimmed = normalizeFromGraphClause(trimmed);
+    trimmed = normalizeCreateGraphTypeRef(trimmed);
+
+    // Parse GQL using ANTLR
+    antlr4::ANTLRInputStream antlrInput(trimmed);
+    GQLLexer lexer(&antlrInput);
+    antlr4::CommonTokenStream tokens(&lexer);
+    GQLParser parser(&tokens);
+
+    // Replace default error listeners (which print to stderr) with a collector
+    // so the first ANTLR message can be surfaced in the exception.
+    lexer.removeErrorListeners();
+    parser.removeErrorListeners();
+    GqlErrorCollector errors;
+    lexer.addErrorListener(&errors);
+    parser.addErrorListener(&errors);
+
+    auto tree = parser.gqlProgram();
+
+    // If GQL parsing fails, only LadybugDB-specific DDL (CREATE NODE TABLE,
+    // CREATE REL TABLE, etc.) is passed through as raw Cypher. Anything else is
+    // a genuine GQL syntax error and gets a GQL-specific error message.
+    if (parser.getNumberOfSyntaxErrors() > 0) {
+        if (isDdlPassThrough(trimmed)) {
+            return std::make_unique<GqlBindData>(trimmed);
+        }
+        std::string detail = errors.messages.empty() ? "" : " (" + errors.messages[0] + ")";
+        throw common::RuntimeException{"Failed to parse GQL query: " + trimmed + detail};
+    }
+
+    // Transform GQL to Cypher. The transformer reports unmapped GQL constructs
+    // as "GQL feature not supported" — there is no silent pass-through.
+    // The graph-type registry and schema catalog live in per-database
+    // extension state (same slot) so that catalog semantics (CREATE GRAPH
+    // TYPE / CREATE SCHEMA ...) stay scoped to one database.
+    //
+    // ExtensionManager data-slot contract (ladybug#1104 follow-up note): keys
+    // are namespaced under the extension's own prefix `gql.*` (here the single
+    // slot `gql.graphTypes`); the dataMap itself is unguarded by design and is
+    // treated as single-threaded-init state — every read-modify-write below
+    // happens inside one CALL GQL invocation, serialized by the connection.
+    auto *extMgr = extension::ExtensionManager::Get(*context);
+    std::string catalogData = extMgr->getData("gql.graphTypes");
+    GraphTypeRegistry registry = GqlToCypherTransformer::deserializeGraphTypes(catalogData);
+    SchemaCatalog schemaCatalog = GqlToCypherTransformer::deserializeSchemaCatalog(catalogData);
+    GqlToCypherTransformer transformer(trimmed, &registry, &schemaCatalog,
+                                       [context](const std::string &graphName) {
+                                           return resolveAnyGraph(*context, graphName);
+                                       });
+    auto cypherQuery = transformer.Transform(*tree);
+    extMgr->setData("gql.graphTypes",
+                    GqlToCypherTransformer::serializeGraphTypes(registry) +
+                        GqlToCypherTransformer::serializeSchemaCatalog(schemaCatalog));
+
+    if (cypherQuery.empty()) {
+        throw common::RuntimeException{"GQL translation produced no Cypher query: " + trimmed};
+    }
+
+    return std::make_unique<GqlBindData>(std::move(cypherQuery),
+        transformer.sawIfNotExistsCreateGraph, transformer.createGraphName);
+}
+
+// =============================================================================
+// Function set
+// =============================================================================
+
+function_set GqlFunction::getFunctionSet() {
+    function_set functionSet;
+    auto func = std::make_unique<TableFunction>(name,
+        std::vector<LogicalTypeID>{LogicalTypeID::STRING});
+    func->tableFunc = TableFunction::emptyTableFunc;
+    func->bindFunc = bindFunc;
+    func->initSharedStateFunc = TableFunction::initEmptySharedState;
+    func->initLocalStateFunc = TableFunction::initEmptyLocalState;
+    func->rewriteFunc = rewriteFunc;
+    func->canParallelFunc = [] { return false; };
+    functionSet.push_back(std::move(func));
+    return functionSet;
+}
+
+// =============================================================================
+// _gql_schemas() -> STRING
+// =============================================================================
+// Reads the schema catalog out of the per-database extension slot and renders
+// it as the JSON payload the TCK harness compares against its own model:
+// {"schemas":["/a","/b"],"directories":["/c"]} — both arrays lexicographically
+// sorted (std::set iteration order), compact separators (no spaces).
+
+static std::string jsonEscape(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+        }
+        out += c;
+    }
+    return out;
+}
+
+static std::string buildSchemasJson(const SchemaCatalog &catalog) {
+    std::string out = "{\"schemas\":[";
+    bool first = true;
+    for (const auto &path : catalog.schemas) {
+        if (!first) {
+            out += ',';
+        }
+        first = false;
+        out += '"';
+        out += jsonEscape(path);
+        out += '"';
+    }
+    out += "],\"directories\":[";
+    first = true;
+    for (const auto &dir : catalog.directories()) {
+        if (!first) {
+            out += ',';
+        }
+        first = false;
+        out += '"';
+        out += jsonEscape(dir);
+        out += '"';
+    }
+    out += "]}";
+    return out;
+}
+
+void GqlSchemasFunction::execFunc(
+    const std::vector<std::shared_ptr<common::ValueVector>>& /*parameters*/,
+    const std::vector<common::SelectionVector*>& /*parameterSelVectors*/,
+    common::ValueVector& result, common::SelectionVector* resultSelVector, void* dataPtr) {
+    auto* bindData = reinterpret_cast<function::FunctionBindData*>(dataPtr);
+    if (bindData == nullptr || bindData->clientContext == nullptr) {
+        // Never silently return a wrong catalog: fail loudly if the bind-time
+        // context was not propagated to the executor.
+        throw common::RuntimeException{"_gql_schemas() requires a client context"};
+    }
+    auto* extMgr = extension::ExtensionManager::Get(*bindData->clientContext);
+    SchemaCatalog catalog = GqlToCypherTransformer::deserializeSchemaCatalog(
+        extMgr->getData("gql.graphTypes"));
+    std::string json = buildSchemasJson(catalog);
+    for (auto i = 0u; i < resultSelVector->getSelSize(); ++i) {
+        auto pos = (*resultSelVector)[i];
+        result.setNull(pos, false);
+        common::StringVector::addString(&result, pos, json);
+    }
+}
+
+function_set GqlSchemasFunction::getFunctionSet() {
+    function_set functionSet;
+    auto func = std::make_unique<ScalarFunction>(name,
+        std::vector<LogicalTypeID>{}, LogicalTypeID::STRING, execFunc);
+    functionSet.push_back(std::move(func));
+    return functionSet;
+}
+
+} // namespace gql_extension
+} // namespace lbug
